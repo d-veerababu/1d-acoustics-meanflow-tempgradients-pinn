@@ -1,0 +1,411 @@
+% Program to predict acoustic pressure in a 1-D uniform duct with axial
+% mean flow and temperature (linear) gradients
+
+clc;
+clear all;
+
+%% Generate training data
+x1 = 0;                     % Starting point of the tube
+x2 = 1;                     % End point of the tube
+
+f = 500;                    % Frequency
+p1 = 1E5;                   % Mean pressure at the inlet
+T1 = 1600;                  % Mean temperature at the inlet
+T2 = 800;                   % Mean temperature at the outlet
+M1 = 0.2;                   % Mach number at the inlet
+gamma = 1.4;                % Specificie hear ratio
+R = 287;                    % Universal gas constant
+
+p_lb = 1+0j;                % Acoustic pressure at the inlet
+p_rb = -1+0j;               % Acoustic pressure at the outlet
+
+P0 = [p_lb p_rb];           % Boundary values
+L = x2-x1;                  % Length of the tube
+m = (T2-T1)/L;              % Slope of the temperature profile
+
+c1 = sqrt(gamma*R*T1);      % Speed of sound at the inlet
+rho1 = p1/(R*T1);           % Mean density at the intlet
+u1 = M1*c1;                 % Mean flow velocity at the inlet
+
+
+numBoundaryConditionPoints = [1 1];
+
+x0BC1 = zeros(1,numBoundaryConditionPoints(1));
+x0BC2 = ones(1,numBoundaryConditionPoints(2));
+
+u0BC1 = real(p_lb);         % Real and imaginary parts of the boundary values
+v0BC1 = imag(p_lb);
+
+u0BC2 = real(p_rb);
+v0BC2 = imag(p_rb);
+
+X0 = [x0BC1 x0BC1 x0BC2 x0BC2];
+UV0 = [u0BC1 v0BC1 u0BC2 v0BC2];
+
+numInternalCollocationPoints = 1000;       % No.of collocation points of the domain
+
+pointSet = sobolset(1); % Base-2 digital sequence that fills space in a highly uniform manner
+points = net(pointSet,numInternalCollocationPoints); % Generates quasirandom point set
+
+dataX = points; % Creates random x-data points between 0 and 2pi
+
+%% Define deep learning model
+numLayers = 5;
+numNeurons = 90;
+maxFuncEvaluations = 1000;
+maxIterations = 1000;
+
+parameters_p = buildNet(numLayers,numNeurons);
+% parameters_u = buildNet(numLayers,numNeurons);
+
+%% Specify optimization options
+options = optimoptions("fmincon", ...
+    HessianApproximation="lbfgs", ...
+    MaxIterations=maxIterations, ...
+    MaxFunctionEvaluations=maxFuncEvaluations, ...
+    OptimalityTolerance=1e-5, ...
+    SpecifyObjectiveGradient=true, ...
+    Display='iter');
+%% Train network for acoustic pressure
+start = tic;
+
+[parametersV_p,parameterNames_p,parameterSizes_p] = parameterStructToVector(parameters_p);
+parametersV_p = extractdata(parametersV_p);
+
+X = dlarray(dataX,"BC");
+X0 = dlarray(X0,"CB");
+UV0 = dlarray(UV0,"CB");
+
+[xeta1,xeta2,xeta3,xeta4,xeta5] = xetas_dl(X,X0,f,p1,T1,m,rho1,u1,gamma,R);
+
+objFun_p = @(parameters_p) objectiveFunction_p(parameters_p,X,X0,UV0,parameterNames_p,parameterSizes_p,xeta1,xeta2,xeta3);
+
+parametersV_p = fmincon(objFun_p,parametersV_p,[],[],[],[],[],[],[],options);
+
+parameters_p = parameterVectorToStruct(parametersV_p,parameterNames_p,parameterSizes_p);
+
+toc(start)
+
+
+%% Evaluate model accuracy
+numPredictions = 500;
+XTest = linspace(0,1,numPredictions);
+
+dlXTest = dlarray(XTest,'CB');
+P = model(parameters_p,dlXTest);
+dlPr_Pred = (1-dlXTest)*UV0(1)+dlXTest*UV0(3)/X0(4)+(X0(4)-dlXTest).*dlXTest.*P(1,:);
+dlPi_Pred = (1-dlXTest)*UV0(2)+dlXTest*UV0(4)/X0(4)+(X0(4)-dlXTest).*dlXTest.*P(2,:);
+
+[xeta1,xeta2,xeta3,xeta4,xeta5] = xetas(XTest,extractdata(X0),f,p1,T1,m,rho1,u1,gamma,R);
+
+[dlUr_Pred,dlUi_Pred] = dlfeval(@particle_velocity,dlXTest,X0,UV0,parameters_p,xeta4,xeta5);
+
+P_Pred = complex(extractdata(dlPr_Pred),extractdata(dlPi_Pred));
+U_Pred = complex(extractdata(dlUr_Pred),extractdata(dlUi_Pred));
+
+% Calcualte true values.
+[P_True,dPdX] = varying_temp_flow_bvp1(XTest,x1,m,gamma,R,rho1,u1,p1,T1,f,P0);
+Pr_True = real(P_True);
+Pi_True = imag(P_True);
+
+U_True = xeta4.*P_True+xeta5.*dPdX;
+Ur_True = real(U_True);
+Ui_True = imag(U_True);
+
+% Impedance calculations
+Z_Pred = P_Pred./U_Pred;
+Zr_Pred = real(Z_Pred);
+Zi_Pred = imag(Z_Pred);
+
+Z_True = P_True./U_True;
+Zr_True = real(Z_True);
+Zi_True = imag(Z_True);
+
+
+% Amplitude calculations
+P_Amp_Pred = P_Pred.*conj(P_Pred);
+U_Amp_Pred = U_Pred.*conj(U_Pred);
+
+P_Amp_True = P_True.*conj(P_True);
+U_Amp_True = U_True.*conj(U_True);
+
+% Transfer functions calculation
+P_TF_Pred = P_Pred./(rho1*c1*U_Pred(1));
+P_TFr_Pred = real(P_TF_Pred);
+P_TFi_Pred = imag(P_TF_Pred);
+
+P_TF_True = P_True./(rho1*c1*U_True(1));
+P_TFr_True = real(P_TF_True);
+P_TFi_True = imag(P_TF_True);
+
+U_TF_Pred = U_Pred./U_Pred(1);
+U_TFr_Pred = real(U_TF_Pred);
+U_TFi_Pred = imag(U_TF_Pred);
+
+U_TF_True = U_True./U_True(1);
+U_TFr_True = real(U_TF_True);
+U_TFi_True = imag(U_TF_True);
+
+% Calculate error.
+
+err_Pr = norm(extractdata(dlPr_Pred) - Pr_True) / norm(Pr_True);
+err_Pi = norm(extractdata(dlPi_Pred) - Pi_True) / norm(Pi_True);
+
+err_Ur = norm(extractdata(dlUr_Pred) - Ur_True) / norm(Ur_True);
+err_Ui = norm(extractdata(dlUi_Pred) - Ui_True) / norm(Ui_True);
+
+err_Zr = norm(Zr_Pred - Zr_True) / norm(Zr_True);
+err_Zi = norm(Zi_Pred - Zi_True) / norm(Zi_True);
+
+err_P_Amp = norm(P_Amp_Pred - P_Amp_True) / norm(P_Amp_True);
+err_U_Amp = norm(U_Amp_Pred - U_Amp_True) / norm(U_Amp_True);
+
+err_P_TFr = norm(P_TFr_Pred - P_TFr_True) / norm(P_TFr_True);
+err_P_TFi = norm(P_TFi_Pred - P_TFi_True) / norm(P_TFi_True);
+
+err_U_TFr = norm(U_TFr_Pred - U_TFr_True) / norm(U_TFr_True);
+err_U_TFi = norm(U_TFi_Pred - U_TFi_True) / norm(U_TFi_True);
+
+
+f1 = figure;
+
+% Plot predictions.
+plot(XTest,extractdata(dlPr_Pred),'-','LineWidth',2);
+% ylim([-1.1, 1.1])
+
+% Plot true values.
+hold on
+plot(XTest, Pr_True, '--','LineWidth',2)
+hold off
+
+xlabel('x','FontSize',14,'FontWeight','bold')
+ylabel('Pressure-Real','FontSize',14,'FontWeight','bold')
+title("Frequency = " + f + ";" + " Error = " + gather(err_Pr));
+
+legend('Predicted','True')
+
+% figFileName1 = sprintf('PReal_%dHz_M_%0.1f_trial_soln.jpg',f,M1);
+% saveas(f1,figFileName1)
+
+f2 = figure;
+
+% Plot predictions.
+plot(XTest,extractdata(dlPi_Pred),'-','LineWidth',2);
+% ylim([-1.1, 1.1])
+
+% Plot true values.
+hold on
+plot(XTest, Pi_True, '--','LineWidth',2)
+hold off
+
+xlabel('x','FontSize',14,'FontWeight','bold')
+ylabel('Pressure-Imaginary','FontSize',14,'FontWeight','bold')
+title("Frequency = " + f + ";" + " Error = " + gather(err_Pi));
+
+legend('Predicted','True')
+
+% figFileName2 = sprintf('PImag_%dHz_M_%0.1f_trial_soln.jpg',f,M1);
+% saveas(f2,figFileName2)
+
+f3 = figure;
+
+% Plot predictions.
+plot(XTest,extractdata(dlUr_Pred),'-','LineWidth',2);
+% ylim([-1.1, 1.1])
+
+% Plot true values.
+hold on
+plot(XTest, Ur_True, '--','LineWidth',2)
+hold off
+
+xlabel('x','FontSize',14,'FontWeight','bold')
+ylabel('Velocity-Real','FontSize',14,'FontWeight','bold')
+title("Frequency = " + f + ";" + " Error = " + gather(err_Ur));
+
+legend('Predicted','True')
+
+% figFileName3 = sprintf('UReal_%dHz_M_%0.1f_trial_soln.jpg',f,M1);
+% saveas(f3,figFileName3)
+
+f4 = figure;
+
+% Plot predictions.
+plot(XTest,extractdata(dlUi_Pred),'-','LineWidth',2);
+% ylim([-1.1, 1.1])
+
+% Plot true values.
+hold on
+plot(XTest, Ui_True, '--','LineWidth',2)
+hold off
+
+xlabel('x','FontSize',14,'FontWeight','bold')
+ylabel('Velocity-Imaginary','FontSize',14,'FontWeight','bold')
+title("Frequency = " + f + ";" + " Error = " + gather(err_Ui));
+
+legend('Predicted','True')
+
+% figFileName4 = sprintf('UImag_%dHz_M_%0.1f_trial_soln.jpg',f,M1);
+% saveas(f4,figFileName4)
+
+f5 = figure;
+
+% Plot predictions.
+plot(XTest,Zr_Pred,'-','LineWidth',2);
+% ylim([-1.1, 1.1])
+
+% Plot true values.
+hold on
+plot(XTest,Zr_True, '--','LineWidth',2)
+hold off
+
+xlabel('x','FontSize',14,'FontWeight','bold')
+ylabel('Impedance-Real','FontSize',14,'FontWeight','bold')
+title("Frequency = " + f + ";" + " Error = " + gather(err_Zr));
+
+legend('Predicted','True')
+
+% figFileName5 = sprintf('ZReal_%dHz_M_%0.1f_trial_soln.jpg',f,M1);
+% saveas(f5,figFileName5)
+
+f6 = figure;
+
+% Plot predictions.
+plot(XTest,Zi_Pred,'-','LineWidth',2);
+% ylim([-1.1, 1.1])
+
+% Plot true values.
+hold on
+plot(XTest,Zi_True, '--','LineWidth',2)
+hold off
+
+xlabel('x','FontSize',14,'FontWeight','bold')
+ylabel('Impedance-Imaginary','FontSize',14,'FontWeight','bold')
+title("Frequency = " + f + ";" + " Error = " + gather(err_Zi));
+
+legend('Predicted','True')
+
+% figFileName6 = sprintf('ZImag_%dHz_M_%0.1f_trial_soln.jpg',f,M1);
+% saveas(f6,figFileName6)
+
+f7 = figure;
+
+% Plot predictions.
+plot(XTest,P_Amp_Pred,'-','LineWidth',2);
+% ylim([-1.1, 1.1])
+
+% Plot true values.
+hold on
+plot(XTest,P_Amp_True, '--','LineWidth',2)
+hold off
+
+xlabel('x','FontSize',14,'FontWeight','bold')
+ylabel('Pressure Amplitude','FontSize',14,'FontWeight','bold')
+title("Frequency = " + f + ";" + " Error = " + gather(err_P_Amp));
+
+legend('Predicted','True')
+
+% figFileName7 = sprintf('PAmp_%dHz_M_%0.1f_trial_soln.jpg',f,M1);
+% saveas(f7,figFileName7)
+
+f8 = figure;
+
+% Plot predictions.
+plot(XTest,U_Amp_Pred,'-','LineWidth',2);
+% ylim([-1.1, 1.1])
+
+% Plot true values.
+hold on
+plot(XTest,U_Amp_True, '--','LineWidth',2)
+hold off
+
+xlabel('x','FontSize',14,'FontWeight','bold')
+ylabel('Velocity Amplitude','FontSize',14,'FontWeight','bold')
+title("Frequency = " + f + ";" + " Error = " + gather(err_U_Amp));
+
+legend('Predicted','True')
+
+% figFileName8 = sprintf('UAmp_%dHz_M_%0.1f_trial_soln.jpg',f,M1);
+% saveas(f8,figFileName8)
+
+f9 = figure;
+
+% Plot predictions.
+plot(XTest,P_TFr_Pred,'-','LineWidth',2);
+% ylim([-1.1, 1.1])
+
+% Plot true values.
+hold on
+plot(XTest,P_TFr_True, '--','LineWidth',2)
+hold off
+
+xlabel('x','FontSize',14,'FontWeight','bold')
+ylabel('Real(Pressure-TF)','FontSize',14,'FontWeight','bold')
+title("Frequency = " + f + ";" + " Error = " + gather(err_P_TFr));
+
+legend('Predicted','True')
+
+% figFileName9 = sprintf('PTFReal_%dHz_M_%0.1f_trial_soln.jpg',f,M1);
+% saveas(f9,figFileName9)
+
+f10 = figure;
+
+% Plot predictions.
+plot(XTest,P_TFi_Pred,'-','LineWidth',2);
+% ylim([-1.1, 1.1])
+
+% Plot true values.
+hold on
+plot(XTest,P_TFi_True, '--','LineWidth',2)
+hold off
+
+xlabel('x','FontSize',14,'FontWeight','bold')
+ylabel('Imag(Pressure-TF)','FontSize',14,'FontWeight','bold')
+title("Frequency = " + f + ";" + " Error = " + gather(err_P_TFi));
+
+legend('Predicted','True')
+
+% figFileName10 = sprintf('PTFImag_%dHz_M_%0.1f_trial_soln.jpg',f,M1);
+% saveas(f10,figFileName10)
+
+
+f11 = figure;
+
+% Plot predictions.
+plot(XTest,U_TFr_Pred,'-','LineWidth',2);
+% ylim([-1.1, 1.1])
+
+% Plot true values.
+hold on
+plot(XTest,U_TFr_True, '--','LineWidth',2)
+hold off
+
+xlabel('x','FontSize',14,'FontWeight','bold')
+ylabel('Real(Velocity-TF)','FontSize',14,'FontWeight','bold')
+title("Frequency = " + f + ";" + " Error = " + gather(err_U_TFr));
+
+legend('Predicted','True')
+
+% figFileName11 = sprintf('UTFReal_%dHz_M_%0.1f_trial_soln.jpg',f,M1);
+% saveas(f11,figFileName11)
+
+f12 = figure;
+
+% Plot predictions.
+plot(XTest,U_TFi_Pred,'-','LineWidth',2);
+% ylim([-1.1, 1.1])
+
+% Plot true values.
+hold on
+plot(XTest,U_TFi_True, '--','LineWidth',2)
+hold off
+
+xlabel('x','FontSize',14,'FontWeight','bold')
+ylabel('Imag(Velocity-TF)','FontSize',14,'FontWeight','bold')
+title("Frequency = " + f + ";" + " Error = " + gather(err_U_TFi));
+
+legend('Predicted','True')
+
+% figFileName12 = sprintf('UTFImag_%dHz_M_%0.1f_trial_soln.jpg',f,M1);
+% saveas(f12,figFileName12)
+
+
